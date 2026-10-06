@@ -1,0 +1,426 @@
+"""
+database.py — Phase 3: Persistence & Caching Layer
+
+SQLite-backed storage for the screener:
+    raw_cache         one row per universe, holding the raw fundamentals as JSON
+    historical_scores one row per (run, symbol), for score-over-time analysis
+
+Design rules:
+    * One short-lived connection per call (thread-safe under Streamlit).
+    * The cache is best-effort: DB failures are logged and degrade to a cache
+      miss; they never crash the caller.
+    * No network calls. Pure stdlib + pandas.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Iterator
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Anchored next to this file so the DB location doesn't depend on the
+# working directory (matters for `streamlit run` from a different folder).
+DB_PATH: Path = Path(__file__).resolve().parent / "screener_cache.db"
+_BUSY_TIMEOUT_S: float = 10.0
+_initialized: bool = False
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS raw_cache (
+    universe_key TEXT PRIMARY KEY,
+    data_json    TEXT NOT NULL,
+    updated_at   TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS historical_scores (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_timestamp   TIMESTAMP NOT NULL,
+    universe_key    TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    rank            INTEGER NOT NULL,
+    quant_score     REAL NOT NULL,
+    valuation_score REAL,
+    quality_score   REAL,
+    growth_score    REAL,
+    price           REAL,
+    pe_ratio        REAL,
+    roe             REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_scores_universe_run
+    ON historical_scores (universe_key, run_timestamp);
+CREATE INDEX IF NOT EXISTS idx_scores_symbol_run
+    ON historical_scores (symbol, run_timestamp);
+"""
+
+# Maps DB column -> accepted DataFrame column names (first non-null wins).
+# Adjust here if quant.py / fetcher.py use different labels.
+_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "symbol": ("Ticker", "Symbol", "symbol", "ticker"),
+    "rank": ("Rank",),
+    "quant_score": ("Quant Score",),
+    "valuation_score": ("Valuation Score",),
+    "quality_score": ("Quality Score",),
+    "growth_score": ("Growth Score",),
+    "price": ("Price", "Current Price"),
+    "pe_ratio": ("Trailing P/E",),
+    "roe": ("ROE",),
+}
+
+
+# --------------------------------------------------------------------------
+# Connection + schema
+# --------------------------------------------------------------------------
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """
+    Open a connection, commit on success / roll back on error, always close.
+
+    `with conn:` alone does NOT close the connection, so we do it explicitly.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=_BUSY_TIMEOUT_S)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def init_db() -> bool:
+    """
+    Create tables and indexes if they don't exist (idempotent).
+
+    Returns True on success, False if the database could not be initialised
+    (the error is logged; callers may continue without caching).
+    """
+    global _initialized
+    try:
+        with _connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")  # readers don't block the writer
+            conn.executescript(_SCHEMA)
+        _initialized = True
+        logger.debug("Database initialised at %s", DB_PATH)
+        return True
+    except sqlite3.Error:
+        logger.exception("Could not initialise database at %s", DB_PATH)
+        return False
+
+
+def _ensure_initialized() -> None:
+    if not _initialized:
+        init_db()
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+def _to_float(value: Any) -> float | None:
+    """Convert to a plain finite float, or None (NaN/inf/garbage -> NULL)."""
+    try:
+        if value is None or pd.isna(value):
+            return None
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _pick(row: dict[str, Any], key: str) -> Any:
+    """First non-null value among the aliases for `key`, else None."""
+    for alias in _COLUMN_ALIASES[key]:
+        value = row.get(alias)
+        if value is not None and pd.notna(value):
+            return value
+    return None
+
+
+# --------------------------------------------------------------------------
+# Raw data cache
+# --------------------------------------------------------------------------
+def get_cached_raw_data(universe_key: str, max_age_hours: int = 12) -> pd.DataFrame | None:
+    """
+    Return the cached raw DataFrame for `universe_key` if it is fresh.
+
+    Returns None (and logs at DEBUG) when the entry is missing, expired,
+    unreadable, or empty.
+    """
+    try:
+        _ensure_initialized()
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT data_json, updated_at FROM raw_cache WHERE universe_key = ?",
+                (universe_key,),
+            ).fetchone()
+    except sqlite3.Error:
+        logger.warning("Cache read failed for '%s'", universe_key, exc_info=True)
+        return None
+
+    if row is None:
+        logger.debug("Cache miss for '%s': no entry", universe_key)
+        return None
+
+    data_json, updated_at_raw = row
+
+    try:
+        updated_at = datetime.fromisoformat(updated_at_raw)
+    except (TypeError, ValueError):
+        logger.warning("Cache entry for '%s' has bad timestamp %r", universe_key, updated_at_raw)
+        return None
+
+    age = datetime.now() - updated_at
+    if age >= timedelta(hours=max_age_hours):
+        logger.debug(
+            "Cache miss for '%s': expired (age %.1fh >= %sh)",
+            universe_key, age.total_seconds() / 3600, max_age_hours,
+        )
+        return None
+
+    try:
+        df = pd.DataFrame.from_records(json.loads(data_json))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        logger.warning("Cache entry for '%s' is corrupt; ignoring", universe_key, exc_info=True)
+        return None
+
+    if df.empty:
+        logger.debug("Cache miss for '%s': entry is empty", universe_key)
+        return None
+
+    logger.debug("Cache hit for '%s' (age %.1f min, %d rows)",
+                 universe_key, age.total_seconds() / 60, len(df))
+    return df
+
+
+def save_cached_raw_data(universe_key: str, df: pd.DataFrame) -> bool:
+    """
+    Upsert `df` as the cached raw data for `universe_key`.
+
+    Empty frames are never cached (they would poison the cache for the whole
+    expiry window). Returns True if written, False otherwise.
+    """
+    if df is None or df.empty:
+        logger.warning("Refusing to cache empty data for '%s'", universe_key)
+        return False
+
+    try:
+        payload = df.to_json(orient="records", date_format="iso", default_handler=str)
+    except (TypeError, ValueError):
+        logger.exception("Could not serialise data for '%s'", universe_key)
+        return False
+
+    now = datetime.now().isoformat()
+    try:
+        _ensure_initialized()
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO raw_cache (universe_key, data_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(universe_key) DO UPDATE SET
+                    data_json  = excluded.data_json,
+                    updated_at = excluded.updated_at
+                """,
+                (universe_key, payload, now),
+            )
+    except sqlite3.Error:
+        logger.warning("Cache write failed for '%s'", universe_key, exc_info=True)
+        return False
+
+    logger.debug("Cached %d rows for '%s'", len(df), universe_key)
+    return True
+
+
+# --------------------------------------------------------------------------
+# Historical score log
+# --------------------------------------------------------------------------
+def log_daily_scores(universe_key: str, ranked_df: pd.DataFrame) -> int:
+    """
+    Batch-insert one snapshot of the ranked DataFrame into historical_scores.
+
+    All rows share a single run timestamp. Rows without a symbol or a usable
+    Quant Score are skipped (both columns are NOT NULL). Optional columns are
+    read with .get() + pd.notna(), so missing ones simply become NULL.
+
+    Returns the number of rows inserted (0 on failure).
+    """
+    if ranked_df is None or ranked_df.empty:
+        logger.warning("log_daily_scores('%s'): nothing to log", universe_key)
+        return 0
+
+    run_ts = datetime.now().isoformat()
+    batch: list[tuple] = []
+    skipped = 0
+
+    for position, row in enumerate(ranked_df.to_dict("records"), start=1):
+        symbol = _pick(row, "symbol")
+        quant_score = _to_float(_pick(row, "quant_score"))
+        if symbol is None or quant_score is None:
+            skipped += 1
+            continue
+
+        rank_value = _to_float(_pick(row, "rank"))
+        rank = int(rank_value) if rank_value is not None else position
+
+        batch.append((
+            run_ts,
+            universe_key,
+            str(symbol).strip(),
+            rank,
+            quant_score,
+            _to_float(_pick(row, "valuation_score")),
+            _to_float(_pick(row, "quality_score")),
+            _to_float(_pick(row, "growth_score")),
+            _to_float(_pick(row, "price")),
+            _to_float(_pick(row, "pe_ratio")),
+            _to_float(_pick(row, "roe")),
+        ))
+
+    if skipped:
+        logger.warning("log_daily_scores('%s'): skipped %d invalid row(s)", universe_key, skipped)
+    if not batch:
+        return 0
+
+    try:
+        _ensure_initialized()
+        with _connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO historical_scores (
+                    run_timestamp, universe_key, symbol, rank, quant_score,
+                    valuation_score, quality_score, growth_score,
+                    price, pe_ratio, roe
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                batch,
+            )
+    except sqlite3.Error:
+        logger.warning("Score logging failed for '%s'", universe_key, exc_info=True)
+        return 0
+
+    logger.debug("Logged %d scores for '%s' at %s", len(batch), universe_key, run_ts)
+    return len(batch)
+
+
+def has_logged_today(universe_key: str) -> bool:
+    """True if a snapshot for `universe_key` exists since local midnight."""
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        _ensure_initialized()
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM historical_scores "
+                "WHERE universe_key = ? AND run_timestamp >= ? LIMIT 1",
+                (universe_key, midnight),
+            ).fetchone()
+    except sqlite3.Error:
+        logger.warning("has_logged_today failed for '%s'", universe_key, exc_info=True)
+        return True  # fail closed: don't spam inserts if the DB is misbehaving
+    return row is not None
+
+
+def get_score_history(
+    symbol: str, universe_key: str | None = None, limit: int = 365
+) -> pd.DataFrame:
+    """Score history for one symbol, oldest first. Empty DataFrame on failure."""
+    query = (
+        "SELECT run_timestamp, universe_key, rank, quant_score, valuation_score, "
+        "quality_score, growth_score, price, pe_ratio, roe "
+        "FROM historical_scores WHERE symbol = ?"
+    )
+    params: list[Any] = [symbol]
+    if universe_key:
+        query += " AND universe_key = ?"
+        params.append(universe_key)
+    query += " ORDER BY run_timestamp DESC LIMIT ?"
+    params.append(limit)
+
+    try:
+        _ensure_initialized()
+        with _connect() as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        logger.warning("History read failed for '%s'", symbol, exc_info=True)
+        return pd.DataFrame()
+
+    df["run_timestamp"] = pd.to_datetime(df["run_timestamp"])
+    return df.sort_values("run_timestamp").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# Verification / Smoke Test Suite
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    import tempfile
+
+    logging.basicConfig(level=logging.DEBUG, format="%(levelname)-7s %(message)s")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Redirect to a throwaway DB so the real cache is never touched.
+        DB_PATH = Path(tmp) / "smoke_test.db"
+        _initialized = False
+
+        # 1. Schema setup
+        assert init_db(), "init_db failed"
+        with _connect() as conn:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            assert {"raw_cache", "historical_scores"} <= tables, tables
+
+        # 2. Raw Cache Read/Write Test
+        assert get_cached_raw_data("nifty_50") is None
+
+        sample_df = pd.DataFrame([
+            {"Ticker": "RELIANCE.NS", "Price": 2500.0, "Trailing P/E": 22.5},
+            {"Ticker": "TCS.NS", "Price": 3800.0, "Trailing P/E": 28.1},
+        ])
+        assert save_cached_raw_data("nifty_50", sample_df)
+
+        cached_df = get_cached_raw_data("nifty_50")
+        assert cached_df is not None and len(cached_df) == 2
+
+        # 3. Daily Score Logging Test
+        sample_ranked = pd.DataFrame([
+            {
+                "Ticker": "RELIANCE.NS",
+                "Rank": 1,
+                "Quant Score": 85.5,
+                "Valuation Score": 80.0,
+                "Quality Score": 90.0,
+                "Growth Score": 86.5,
+                "Price": 2500.0,
+                "Trailing P/E": 22.5,
+                "ROE": 0.15,
+            },
+            {
+                "Ticker": "TCS.NS",
+                "Rank": 2,
+                "Quant Score": 82.0,
+                "Valuation Score": 75.0,
+                "Quality Score": 92.0,
+                "Growth Score": 79.0,
+                "Price": 3800.0,
+                "Trailing P/E": 28.1,
+                "ROE": 0.40,
+            },
+        ])
+
+        logged = log_daily_scores("nifty_50", sample_ranked)
+        assert logged == 2
+        assert has_logged_today("nifty_50")
+
+        # 4. History Read Test
+        history = get_score_history("RELIANCE.NS")
+        assert not history.empty and len(history) == 1
+
+    print("\n✅ All database smoke tests passed successfully!")
